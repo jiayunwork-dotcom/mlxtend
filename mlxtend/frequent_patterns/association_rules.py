@@ -41,6 +41,8 @@ def association_rules(
     min_threshold=0.8,
     support_only=False,
     return_metrics: list = _metrics,
+    reference_cohort=None,
+    min_confidence_delta=None,
 ) -> pd.DataFrame:
     """Generates a DataFrame of association rules including the
     metrics 'score', 'confidence', and 'lift'
@@ -49,7 +51,9 @@ def association_rules(
     -----------
     df : pandas DataFrame
       pandas DataFrame of frequent itemsets
-      with columns ['support', 'itemsets']
+      with columns ['support', 'itemsets'], or the cohort-aware layout
+      ['cohort', 'support', 'itemsets'] produced by
+      ``fpgrowth(..., cohorts=...)``.
 
     df_orig : pandas DataFrame (default: None)
       DataFrame with original input data. Only provided when null_values exist
@@ -58,7 +62,8 @@ def association_rules(
       Number of transactions in original input data (df_orig)
 
     null_values : bool (default: False)
-      In case there are null values as NaNs in the original input data
+      In case there are null values as NaNs in the original input data.
+      Not supported for cohort input.
 
     metric : string (default: 'confidence')
       Metric to evaluate if a rule is of interest.
@@ -81,7 +86,8 @@ def association_rules(
     min_threshold : float (default: 0.8)
       Minimal threshold for the evaluation metric,
       via the `metric` parameter,
-      to decide whether a candidate rule is of interest.
+      to decide whether a candidate rule is of interest.  For cohort input
+      this threshold is applied to the rule's metric *within its own cohort*.
 
     support_only : bool (default: False)
       Only computes the rule support and fills the other
@@ -94,6 +100,23 @@ def association_rules(
       b) you simply want to speed up the computation because
       you don't need the other metrics.
 
+      Not supported for cohort input.
+
+    reference_cohort : str (default: None)
+      Cohort used as the comparison baseline.  When provided (cohort input
+      only), rules are generated for every *other* cohort and augmented
+      with ``reference_cohort``, ``reference support``,
+      ``reference confidence``, ``reference lift``, ``support delta`` and
+      ``confidence delta``.  Both deltas are the current cohort's value minus
+      the reference cohort's value.  Without this argument, ordinary (non
+      comparative) rules are produced for each cohort separately and no
+      reference columns are added.
+
+    min_confidence_delta : float (default: None)
+      Optional lower bound on ``confidence delta``.  Requires
+      `reference_cohort`; rules whose delta is NaN (because the reference
+      cohort has zero antecedent support) can never pass it.
+
     Returns
     ----------
     pandas DataFrame with columns "antecedents" and "consequents"
@@ -103,6 +126,9 @@ def association_rules(
       "leverage", "conviction"
       of all rules for which
       metric(rule) >= min_threshold.
+      For cohort input a "cohort" column is present, and with
+      `reference_cohort` the reference/delta columns described above are
+      appended.
       Each entry in the "antecedents" and "consequents" columns are
       of type `frozenset`, which is a Python built-in type that
       behaves similarly to sets except that it is immutable
@@ -115,6 +141,34 @@ def association_rules(
     https://rasbt.github.io/mlxtend/user_guide/frequent_patterns/association_rules/
 
     """
+    is_cohort_input = "cohort" in df.columns
+
+    if is_cohort_input:
+        return _cohort_association_rules(
+            df,
+            num_itemsets=num_itemsets,
+            metric=metric,
+            min_threshold=min_threshold,
+            support_only=support_only,
+            null_values=null_values,
+            df_orig=df_orig,
+            return_metrics=return_metrics,
+            reference_cohort=reference_cohort,
+            min_confidence_delta=min_confidence_delta,
+        )
+
+    if reference_cohort is not None:
+        raise ValueError(
+            "`reference_cohort` is only supported for cohort-aware input "
+            "with a 'cohort' column, as produced by "
+            "`fpgrowth(..., cohorts=...)`."
+        )
+    if min_confidence_delta is not None:
+        raise ValueError(
+            "`min_confidence_delta` requires cohort-aware input with a "
+            "'cohort' column together with `reference_cohort`."
+        )
+
     # if null values exist, df_orig must be provided
     if null_values and df_orig is None:
         raise TypeError("If null values exist, df_orig must be provided.")
@@ -392,3 +446,315 @@ def association_rules(
                 )
 
         return df_res
+
+
+_COHORT_REFERENCE_COLUMNS = [
+    "reference_cohort",
+    "reference support",
+    "reference confidence",
+    "reference lift",
+    "support delta",
+    "confidence delta",
+]
+
+
+def _cohort_rule_metrics(sAC, sA, sC):
+    """Compute rule metrics from *within-cohort* supports.
+
+    All three supports come from the same cohort.  Nothing is re-aligned
+    across cohorts, and a below-threshold itemset is not silently turned into
+    zero support: the caller validates the index first.
+
+    NaN semantics:
+    * ``confidence``/``lift`` are NaN when the antecedent support is zero.
+      Callers skip those rules entirely.
+    * ``lift`` is NaN when the consequent support is zero in this cohort.
+    * ``representativity`` is 1 because cohort layouts carry no null-value
+      bookkeeping (a cohort's baskets are fully attributable to it).
+    """
+    nan = float("nan")
+    confidence = sAC / sA if sA > 0 else nan
+    lift = confidence / sC if (sC > 0 and confidence == confidence) else nan
+    leverage = sAC - sA * sC
+    if confidence < 1.0:
+        conviction = (1.0 - sC) / (1.0 - confidence)
+    else:
+        conviction = float("inf")
+    denominator = max(sAC * (1 - sA), sA * (sC - sAC))
+    zhangs = leverage / denominator if denominator != 0 else 0.0
+    jaccard_denom = sA + sC - sAC
+    jaccard = sAC / jaccard_denom if jaccard_denom != 0 else nan
+    certainty_denom = 1.0 - sC
+    certainty = (confidence - sC) / certainty_denom if certainty_denom != 0 else 0.0
+    confidence_ca = sAC / sC if sC > 0 else nan
+    kulczynski = (
+        (confidence + confidence_ca) / 2.0 if confidence == confidence else nan
+    )
+    return {
+        "antecedent support": sA,
+        "consequent support": sC,
+        "support": sAC,
+        "confidence": confidence,
+        "lift": lift,
+        "representativity": 1.0,
+        "leverage": leverage,
+        "conviction": conviction,
+        "zhangs_metric": zhangs,
+        "jaccard": jaccard,
+        "certainty": certainty,
+        "kulczynski": kulczynski,
+    }
+
+
+def _cohort_association_rules(
+    df,
+    num_itemsets,
+    metric,
+    min_threshold,
+    support_only,
+    null_values,
+    df_orig,
+    return_metrics,
+    reference_cohort,
+    min_confidence_delta,
+):
+    if support_only:
+        raise ValueError(
+            "`support_only=True` is not supported for cohort-aware input."
+        )
+    if null_values or df_orig is not None:
+        raise ValueError(
+            "`null_values`/`df_orig` are not supported for cohort-aware input."
+        )
+    if reference_cohort is None and min_confidence_delta is not None:
+        raise ValueError(
+            "`min_confidence_delta` requires `reference_cohort` to be set."
+        )
+    if min_confidence_delta is not None:
+        try:
+            min_confidence_delta = float(min_confidence_delta)
+        except (TypeError, ValueError):
+            raise ValueError("`min_confidence_delta` must be a number.")
+        if not np.isfinite(min_confidence_delta):
+            raise ValueError("`min_confidence_delta` must be finite.")
+
+    if not all(col in df.columns for col in ["cohort", "support", "itemsets"]):
+        raise ValueError(
+            "Cohort-aware input needs the columns 'cohort', 'support' and "
+            "'itemsets'."
+        )
+    if not df.shape[0]:
+        raise ValueError(
+            "The input DataFrame `df` containing the frequent itemsets is empty."
+        )
+
+    # Validate metrics against the ordinary metric vocabulary.
+    if metric not in _metrics:
+        raise ValueError(
+            "Metric must be 'confidence' or 'lift', got '{}'".format(metric)
+        )
+
+    valid_metric_names = set(_metrics)
+    missing_return = [m for m in return_metrics if m not in valid_metric_names]
+    if missing_return:
+        raise ValueError(
+            "Unknown return metric(s): %s." % ", ".join(map(str, missing_return))
+        )
+
+    # --- Build the per-cohort support index -------------------------------
+    # Rows are read positionally.  No groupby/dict comprehension that would
+    # collapse *all* rows of an itemset into a single scalar is used: each
+    # (cohort, itemset) pair must appear at most once, and completeness of
+    # every cohort's itemset set is required for antecedent/consequent lookup.
+    cohort_order = []
+    per_cohort = {}
+    duplicate_pairs = []
+    for cohort, support, itemset in zip(
+        df["cohort"].to_numpy(), df["support"].to_numpy(), df["itemsets"].to_numpy()
+    ):
+        if not isinstance(cohort, str) or cohort == "":
+            raise ValueError(
+                "The 'cohort' column must contain non-empty strings; got %r."
+                % (cohort,)
+            )
+        try:
+            support = float(support)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "The 'support' column must contain numeric values; got %r."
+                % (support,)
+            )
+        if not np.isfinite(support) or support < 0 or support > 1:
+            raise ValueError(
+                "The 'support' column must contain finite values in [0, 1]; "
+                "got %r." % (support,)
+            )
+        key = frozenset(itemset)
+        if cohort not in per_cohort:
+            per_cohort[cohort] = {}
+            cohort_order.append(cohort)
+        if key in per_cohort[cohort]:
+            duplicate_pairs.append((cohort, key))
+            continue
+        per_cohort[cohort][key] = support
+
+    if duplicate_pairs:
+        cohort, key = duplicate_pairs[0]
+        raise ValueError(
+            "Duplicate (cohort, itemset) rows are not allowed; found %r in "
+            "cohort %r." % (sorted(key, key=repr), cohort)
+        )
+
+    # Every cohort must expose the same itemset universe.  A missing itemset
+    # is *not* interpreted as zero support: that would silently turn an
+    # unfinished mining result into a confidence of zero.
+    universe = set(per_cohort[cohort_order[0]])
+    for cohort in cohort_order[1:]:
+        if set(per_cohort[cohort]) != universe:
+            missing = sorted(
+                set(per_cohort[cohort_order[0]]) - set(per_cohort[cohort]),
+                key=lambda s: sorted(map(repr, s)),
+            )
+            if missing:
+                raise ValueError(
+                    "Cohort %r is missing %d itemset(s) present in the other "
+                    "cohorts (e.g. %r).  The cohort input from fpgrowth must "
+                    "be complete; missing supports are not filled with zero."
+                    % (cohort, len(missing), sorted(missing[0], key=repr))
+                )
+            raise ValueError(
+                "Cohort %r contains itemset(s) missing from cohort %r."
+                % (cohort, cohort_order[0])
+            )
+
+    if reference_cohort is not None:
+        if reference_cohort not in per_cohort:
+            raise ValueError(
+                "`reference_cohort` %r is not one of the cohorts in the input "
+                "(%s)." % (reference_cohort, ", ".join(map(repr, cohort_order)))
+            )
+        if len(cohort_order) < 2:
+            raise ValueError(
+                "`reference_cohort` requires at least two cohorts to compare."
+            )
+
+    # --- Generate rules per cohort, reusing the same evidence -------------
+    rows = []
+    for cohort in cohort_order:
+        if reference_cohort is not None and cohort == reference_cohort:
+            continue
+        supports = per_cohort[cohort]
+        for itemset in supports:
+            if len(itemset) < 2:
+                continue
+            sAC = supports[itemset]
+            for idx in range(len(itemset) - 1, 0, -1):
+                for antecedent_items in combinations(itemset, r=idx):
+                    antecedent = frozenset(antecedent_items)
+                    consequent = itemset.difference(antecedent)
+                    sA = _cohort_support(supports, antecedent, cohort)
+                    sC = _cohort_support(supports, consequent, cohort)
+                    if sA <= 0:
+                        # A rule with no antecedent evidence is not a rule.
+                        continue
+                    computed = _cohort_rule_metrics(
+                        np.float64(sAC), np.float64(sA), np.float64(sC)
+                    )
+                    score = computed[metric]
+                    if not _score_passes(score, min_threshold):
+                        continue
+                    if reference_cohort is not None:
+                        reference = _reference_evidence(
+                            per_cohort[reference_cohort],
+                            antecedent,
+                            consequent,
+                            reference_cohort,
+                        )
+                        confidence_delta = computed["confidence"] - reference["confidence"]
+                        if min_confidence_delta is not None and not (
+                            confidence_delta >= min_confidence_delta
+                        ):
+                            continue
+                        support_delta = computed["support"] - reference["support"]
+                        row = {
+                            "antecedents": antecedent,
+                            "consequents": consequent,
+                            "cohort": cohort,
+                            "reference_cohort": reference_cohort,
+                        }
+                        row.update(
+                            {
+                                name: computed[name]
+                                for name in return_metrics
+                            }
+                        )
+                        row["reference support"] = reference["support"]
+                        row["reference confidence"] = reference["confidence"]
+                        row["reference lift"] = reference["lift"]
+                        row["support delta"] = support_delta
+                        row["confidence delta"] = confidence_delta
+                        rows.append(row)
+                    else:
+                        row = {
+                            "antecedents": antecedent,
+                            "consequents": consequent,
+                            "cohort": cohort,
+                        }
+                        row.update(
+                            {name: computed[name] for name in return_metrics}
+                        )
+                        rows.append(row)
+
+    if reference_cohort is not None:
+        columns = (
+            ["antecedents", "consequents"]
+            + list(return_metrics)
+            + ["cohort", "reference_cohort"]
+            + _COHORT_REFERENCE_COLUMNS[1:]
+        )
+    else:
+        columns = ["antecedents", "consequents"] + list(return_metrics) + ["cohort"]
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _score_passes(score, threshold):
+    if isinstance(score, np.ndarray):
+        score = score.item() if score.size else np.nan
+    if score is None:
+        return False
+    try:
+        return bool(score >= threshold)
+    except TypeError:
+        return False
+
+
+def _cohort_support(supports, itemset, cohort):
+    """Fetch support, turning an incomplete index into a loud error."""
+    try:
+        return supports[itemset]
+    except KeyError:
+        raise ValueError(
+            "Cohort %r has no support entry for itemset %r, which is needed to "
+            "evaluate a rule.  The cohort input must be complete; missing "
+            "supports are not filled with zero." % (cohort, sorted(itemset, key=repr))
+        )
+
+
+def _reference_evidence(reference_supports, antecedent, consequent, cohort):
+    """Look up the *same* rule in the reference cohort.
+
+    Supports are those of itemsets that survived mining in at least one
+    cohort, not just in the reference one.  Hence a reference support of zero
+    is a genuine zero, while a rule whose reference antecedent support is
+    zero yields NaN confidence and delta (never a fabricated value).
+    """
+    sAC = _cohort_support(reference_supports, antecedent.union(consequent), cohort)
+    sA = _cohort_support(reference_supports, antecedent, cohort)
+    sC = _cohort_support(reference_supports, consequent, cohort)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        confidence = np.nan if sA <= 0 else sAC / sA
+        lift = np.nan if (sA <= 0 or sC <= 0) else confidence / sC
+    return {"support": sAC, "confidence": confidence, "lift": lift}
