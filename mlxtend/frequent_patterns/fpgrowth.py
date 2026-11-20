@@ -120,8 +120,16 @@ def fpgrowth(
         colname_map = {idx: item for idx, item in enumerate(df.columns)}
 
     if cohorts is not None:
-        codes, labels, totals, weights = fpc.prepare_cohorts(
+        codes, labels, raw_totals, raw_weights = fpc.prepare_cohorts(
             df, cohorts, sample_weight
+        )
+        # Rescale each cohort's weights by an exact power of two whenever the
+        # raw totals would overflow or underflow.  Ratios inside a cohort are
+        # untouched, so the selected itemsets and their supports are the same
+        # as on a unit change applied by the caller; only the float unit used
+        # for the tree counters changes.
+        weights, _exponents, totals = fpc.rescale_weights(
+            raw_weights, cohort_codes=codes, n_cohorts=len(labels)
         )
         minsup = {code: min_support * totals[code] for code in range(len(labels))}
         tree, _, _ = fpc.setup_fptree(
@@ -146,9 +154,15 @@ def fpgrowth(
         )
 
     if sample_weight is not None:
-        weights = fpc.prepare_sample_weight(df, sample_weight)
-        threshold = min_support * float(weights.sum())
-        tree, _, _ = fpc.setup_fptree(df, min_support, sample_weight=weights)
+        raw_weights = fpc.prepare_sample_weight(df, sample_weight)
+        # Whole-batch rescale (the weight-only analogue of the per-cohort
+        # unit change).  Positivity and zero/positive row positions are
+        # preserved exactly.
+        weights, _exponent, total_weight = fpc.rescale_weights(raw_weights)
+        threshold = min_support * total_weight
+        tree, _, _ = fpc.setup_fptree(
+            df, min_support, sample_weight=weights
+        )
         generator = fpg_step(tree, threshold, colname_map, max_len, verbose)
         return fpc.generate_itemsets(
             generator,
@@ -158,6 +172,7 @@ def fpgrowth(
             len(df.index),
             colname_map,
             sample_weight=weights,
+            weighted_total=total_weight,
         )
 
     tree, disabled, _ = fpc.setup_fptree(df, min_support)

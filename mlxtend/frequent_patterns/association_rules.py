@@ -458,12 +458,18 @@ _COHORT_REFERENCE_COLUMNS = [
 ]
 
 
-def _cohort_rule_metrics(sAC, sA, sC):
+def _cohort_rule_metrics(sAC, sA, sC, counts=None):
     """Compute rule metrics from *within-cohort* supports.
 
     All three supports come from the same cohort.  Nothing is re-aligned
     across cohorts, and a below-threshold itemset is not silently turned into
     zero support: the caller validates the index first.
+
+    When ``counts`` is given it carries the underlying positive weighted
+    counts ``(cAC, cA, cC)`` of the same three itemsets.  Ratios that would
+    underflow if taken from the (possibly zero-displaying) support column are
+    then computed from the counts instead, which keeps a finite confidence
+    for tiny-but-positive evidence.
 
     NaN semantics:
     * ``confidence``/``lift`` are NaN when the antecedent support is zero.
@@ -473,8 +479,20 @@ def _cohort_rule_metrics(sAC, sA, sC):
       bookkeeping (a cohort's baskets are fully attributable to it).
     """
     nan = float("nan")
-    confidence = sAC / sA if sA > 0 else nan
-    lift = confidence / sC if (sC > 0 and confidence == confidence) else nan
+    if counts is not None:
+        cAC, cA, cC, total = counts
+        confidence = fpc.safe_fraction([cAC], [cA]) if cA > 0 else nan
+        if cC <= 0:
+            lift = nan
+        else:
+            # Ratios of same-magnitude counts can still exceed the float
+            # range when intermediate products are formed, so the lift is
+            # accumulated in log space; inf/0 come back only when the true
+            # value crosses the float bounds.
+            lift = fpc.safe_fraction([cAC, total], [cA, cC])
+    else:
+        confidence = sAC / sA if sA > 0 else nan
+        lift = confidence / sC if (sC > 0 and confidence == confidence) else nan
     leverage = sAC - sA * sC
     if confidence < 1.0:
         conviction = (1.0 - sC) / (1.0 - confidence)
@@ -565,7 +583,12 @@ def _cohort_association_rules(
     # Rows are read positionally.  No groupby/dict comprehension that would
     # collapse *all* rows of an itemset into a single scalar is used: each
     # (cohort, itemset) pair must appear at most once, and completeness of
-    # every cohort's itemset set is required for antecedent/consequent lookup.
+    # every cohort's itemset set is required for antecedent/consequent
+    # lookup.  The index maps each pair to its *displayed* support; the
+    # evidence sidecar (if present) additionally exposes positive counts that
+    # underflowed to zero in that column, so a displayed zero can still be
+    # genuine positive evidence.
+    evidence = fpc.get_weighted_evidence(df)
     cohort_order = []
     per_cohort = {}
     duplicate_pairs = []
@@ -627,6 +650,41 @@ def _cohort_association_rules(
                 % (cohort, cohort_order[0])
             )
 
+    # Resolve the scaled per-cohort totals carried alongside the result.
+    # When no sidecar exists (a hand-built plain support table) the totals
+    # are irrelevant because no displayed zero can hide positive evidence.
+    # Totals are keyed by the stable cohort labels, independent of row order.
+    cohort_totals = {}
+    if evidence is not None:
+        raw_totals = evidence[fpc._TOTAL_EVIDENCE_KEY]
+        for cohort in cohort_order:
+            if cohort not in raw_totals:
+                raise ValueError(
+                    "The weighted evidence attached to the input is missing "
+                    "the total for cohort %r; pass the frame returned by "
+                    "fpgrowth without stripping its metadata." % cohort
+                )
+            cohort_totals[cohort] = float(raw_totals[cohort])
+
+    def positive_count(cohort, itemset, displayed):
+        """Positive weighted count behind one (cohort, itemset) entry.
+
+        Distinguishes the three evidence states: a true zero (returns 0.0),
+        a tiny positive whose support displays as zero (sidecar count), and
+        an ordinary positive support (support times the cohort total).
+        Without a sidecar only the displayed support exists, so it is
+        returned unchanged and the legacy support-based arithmetic applies.
+        """
+        if evidence is None:
+            return float(displayed)
+        return fpc.evidence_count(
+            evidence,
+            itemset,
+            cohort,
+            displayed,
+            cohort_totals[cohort],
+        )
+
     if reference_cohort is not None:
         if reference_cohort not in per_cohort:
             raise ValueError(
@@ -647,18 +705,53 @@ def _cohort_association_rules(
         for itemset in supports:
             if len(itemset) < 2:
                 continue
-            sAC = supports[itemset]
+            sAC_display = supports[itemset]
             for idx in range(len(itemset) - 1, 0, -1):
                 for antecedent_items in combinations(itemset, r=idx):
                     antecedent = frozenset(antecedent_items)
                     consequent = itemset.difference(antecedent)
-                    sA = _cohort_support(supports, antecedent, cohort)
-                    sC = _cohort_support(supports, consequent, cohort)
-                    if sA <= 0:
-                        # A rule with no antecedent evidence is not a rule.
+                    sA_display = _cohort_support(supports, antecedent, cohort)
+                    sC_display = _cohort_support(supports, consequent, cohort)
+
+                    # Current-cohort antecedent evidence: a rule needs real
+                    # positive evidence, not merely a non-negative display.
+                    sA_count = positive_count(cohort, antecedent, sA_display)
+                    if evidence is not None and sA_count <= 0.0:
+                        # No positive antecedent weight in this cohort: not a
+                        # rule, regardless of what the support column shows.
                         continue
+                    if evidence is None and sA_display <= 0.0:
+                        continue
+
+                    if evidence is not None:
+                        # Recompute every metric from the positive counts so
+                        # tiny-but-positive evidence survives even when its
+                        # displayed support is zero.
+                        sAC_count = positive_count(
+                            cohort, itemset, sAC_display
+                        )
+                        sC_count = positive_count(
+                            cohort, consequent, sC_display
+                        )
+                        total = cohort_totals[cohort]
+                        sAC = sAC_count / total
+                        sA = sA_count / total
+                        sC = sC_count / total
+                        count_tuple = (
+                            sAC_count,
+                            sA_count,
+                            sC_count,
+                            total,
+                        )
+                    else:
+                        sAC, sA, sC = sAC_display, sA_display, sC_display
+                        count_tuple = None
+
                     computed = _cohort_rule_metrics(
-                        np.float64(sAC), np.float64(sA), np.float64(sC)
+                        np.float64(sAC),
+                        np.float64(sA),
+                        np.float64(sC),
+                        counts=count_tuple,
                     )
                     score = computed[metric]
                     if not _score_passes(score, min_threshold):
@@ -669,8 +762,13 @@ def _cohort_association_rules(
                             antecedent,
                             consequent,
                             reference_cohort,
+                            evidence=evidence,
+                            cohort_total=cohort_totals.get(reference_cohort),
+                            positive_count=positive_count,
                         )
-                        confidence_delta = computed["confidence"] - reference["confidence"]
+                        confidence_delta = (
+                            computed["confidence"] - reference["confidence"]
+                        )
                         if min_confidence_delta is not None and not (
                             confidence_delta >= min_confidence_delta
                         ):
@@ -743,18 +841,78 @@ def _cohort_support(supports, itemset, cohort):
         )
 
 
-def _reference_evidence(reference_supports, antecedent, consequent, cohort):
+def _reference_evidence(
+    reference_supports,
+    antecedent,
+    consequent,
+    cohort,
+    evidence=None,
+    cohort_total=None,
+    positive_count=None,
+):
     """Look up the *same* rule in the reference cohort.
 
     Supports are those of itemsets that survived mining in at least one
-    cohort, not just in the reference one.  Hence a reference support of zero
-    is a genuine zero, while a rule whose reference antecedent support is
-    zero yields NaN confidence and delta (never a fabricated value).
+    cohort, not just in the reference one.  Three cases stay distinct:
+
+    * **true zero** (no positive reference weight for the antecedent): the
+      confidence is genuinely undefined and NaN is returned, so a delta
+      filter can never pass the rule;
+    * **tiny positive** (positive weight but a support that displays as
+      zero): the evidence sidecar supplies the real count and a finite
+      confidence is computed from counts, never from the zero display;
+    * **missing itemset**: still a loud error via ``_cohort_support`` rather
+      than a fabricated zero.
     """
-    sAC = _cohort_support(reference_supports, antecedent.union(consequent), cohort)
-    sA = _cohort_support(reference_supports, antecedent, cohort)
-    sC = _cohort_support(reference_supports, consequent, cohort)
+    combined = antecedent.union(consequent)
+    sAC_display = _cohort_support(reference_supports, combined, cohort)
+    sA_display = _cohort_support(reference_supports, antecedent, cohort)
+    sC_display = _cohort_support(reference_supports, consequent, cohort)
+
+    if evidence is None:
+        # Plain support table: the displayed values are the only evidence.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            confidence = np.nan if sA_display <= 0 else sAC_display / sA_display
+            lift = (
+                np.nan
+                if (sA_display <= 0 or sC_display <= 0)
+                else confidence / sC_display
+            )
+        return {
+            "support": sAC_display,
+            "confidence": confidence,
+            "lift": lift,
+        }
+
+    sA_count = positive_count(cohort, antecedent, sA_display)
+    if sA_count <= 0.0:
+        # Genuine absence of positive antecedent weight: undefined.
+        nan = float("nan")
+        return {
+            "support": sAC_display,
+            "confidence": nan,
+            "lift": nan,
+        }
+
+    sAC_count = positive_count(cohort, combined, sAC_display)
+    sC_count = positive_count(cohort, consequent, sC_display)
+    total = cohort_total
     with np.errstate(divide="ignore", invalid="ignore"):
-        confidence = np.nan if sA <= 0 else sAC / sA
-        lift = np.nan if (sA <= 0 or sC <= 0) else confidence / sC
-    return {"support": sAC, "confidence": confidence, "lift": lift}
+        # Confidence is a ratio of two counts from the same cohort; taking
+        # the ratio in log space avoids an intermediate support underflow
+        # that would turn a finite confidence into 0/0.
+        confidence = fpc.safe_fraction([sAC_count], [sA_count])
+        if sC_count <= 0.0:
+            lift = np.nan
+        else:
+            # Lift = cAC * total / (cA * cC), accumulated in log space so a
+            # product that overflows or underflows cannot poison a finite
+            # true value.
+            lift = fpc.safe_fraction(
+                [sAC_count, total], [sA_count, sC_count]
+            )
+    return {
+        "support": sAC_display,
+        "confidence": confidence,
+        "lift": lift,
+    }

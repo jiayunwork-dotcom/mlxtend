@@ -1,4 +1,5 @@
 import collections
+import math
 import warnings
 
 import numpy as np
@@ -12,10 +13,249 @@ warnings.simplefilter("always", DeprecationWarning)
 # 0.6 can be represented as 0.5999999999999999.
 _SUPPORT_EPS = 1e-12
 
+# Names used to attach the tiny-but-positive evidence that a plain float
+# ``support`` column cannot itself carry.  The sidecar lives in the result
+# frame's ``attrs`` mapping, so copying the frame or permuting its rows keeps
+# the evidence attached without any dependence on row order.
+EVIDENCE_ATTR = "weighted_evidence"
+_TINY_EVIDENCE_KEY = "tiny_counts"
+_TOTAL_EVIDENCE_KEY = "cohort_totals"
+
+
+def build_weighted_evidence(tiny_counts, cohort_totals=None):
+    """Assemble the evidence sidecar attached to a mining result frame.
+
+    ``tiny_counts`` maps ``(frozenset itemset, cohort label)`` (the label is
+    ``None`` in weight-only mode) to the positive scaled count of that
+    itemset.  Only itemsets whose *displayed* support underflowed to zero
+    need an entry; the positive counts of every other itemset are recoverable
+    from the support column and the cohort totals.  Cohort labels, rather
+    than first-appearance positions, key the sidecar so the evidence stays
+    correct after the result rows are copied or permuted.
+    ``cohort_totals`` maps the same labels to their scaled total weights.
+    """
+    return {
+        _TINY_EVIDENCE_KEY: dict(tiny_counts),
+        _TOTAL_EVIDENCE_KEY: dict(cohort_totals or {}),
+    }
+
+
+def get_weighted_evidence(df):
+    """Return the evidence sidecar of a frame, or ``None``."""
+    if not hasattr(df, "attrs"):
+        return None
+    evidence = df.attrs.get(EVIDENCE_ATTR)
+    if not isinstance(evidence, dict):
+        return None
+    if _TINY_EVIDENCE_KEY not in evidence:
+        return None
+    return evidence
+
+
+def evidence_count(evidence, itemset, cohort_label, displayed_support, total):
+    """Resolve the positive weighted count behind a support entry.
+
+    The three cases the caller must keep apart are:
+
+    * **true zero** - no tiny entry and the displayed support is zero: the
+      count really is zero;
+    * **tiny positive** - a tiny entry exists even though the displayed
+      support underflowed to zero: return that stored positive count;
+    * **ordinary** - a positive, representable support: the count is the
+      displayed support times the (scaled) cohort total.
+    """
+    if evidence is not None:
+        tiny = evidence[_TINY_EVIDENCE_KEY].get((itemset, cohort_label))
+        if tiny is not None:
+            return float(tiny)
+        if displayed_support <= 0.0:
+            return 0.0
+        return float(displayed_support) * float(total)
+    # No sidecar (plain hand-built support table): only the displayed value
+    # exists, so there is no hidden positive count to recover.  Returning the
+    # displayed value itself keeps the evidence-free code path on its
+    # original support-based arithmetic.
+    return float(displayed_support)
+
+
+_FLOAT_MAX_LOG = math.log(np.finfo(np.float64).max)
+_FLOAT_MIN_LOG = math.log(
+    np.finfo(np.float64).tiny * np.spacing(np.float64(1.0))
+)
+
+
+def safe_fraction(numerator_terms, denominator_terms):
+    """Product of ``numerator_terms`` over product of ``denominator_terms``.
+
+    Rule metrics such as confidence and lift are ratios of weighted counts
+    whose magnitudes can span the whole floating-point range.  A direct
+    product can overflow to ``inf`` or underflow to zero even when the
+    fraction itself is representable.  The ordinary floating-point product
+    is therefore tried first, which preserves the exact rounding behaviour
+    (e.g. the exact 0.5 of two equal counts); only when that result is
+    non-finite or zero while a positive numerator exists does the function
+    fall back to log-space accumulation, mapping back to ``inf``/``0.0``
+    only when the true value really crosses the float bounds.
+
+    A zero denominator term yields NaN (the metric is undefined, matching
+    the support-based code path); a zero numerator term with strictly
+    positive denominators yields ``0.0``.
+    """
+    numerator_terms = list(numerator_terms)
+    denominator_terms = list(denominator_terms)
+    if any(term <= 0.0 or not math.isfinite(term) for term in denominator_terms):
+        return float("nan")
+    if any(term <= 0.0 or not math.isfinite(term) for term in numerator_terms):
+        return 0.0
+
+    numerator = 1.0
+    for term in numerator_terms:
+        numerator *= term
+    denominator = 1.0
+    for term in denominator_terms:
+        denominator *= term
+    if denominator > 0.0:
+        direct = numerator / denominator
+        if math.isfinite(direct) and direct > 0.0:
+            return direct
+
+    # Log-space fallback: math.log of a positive finite count is always
+    # finite, so no intermediate product can overflow or underflow.
+    log_value = math.fsum(math.log(term) for term in numerator_terms) - math.fsum(
+        math.log(term) for term in denominator_terms
+    )
+    if log_value >= _FLOAT_MAX_LOG:
+        return float("inf")
+    if log_value <= _FLOAT_MIN_LOG:
+        return 0.0
+    return math.exp(log_value)
+
 
 def _ge_threshold(value, threshold):
     """Return ``value >= threshold`` with a small relative tolerance."""
     return value >= threshold - _SUPPORT_EPS * max(1.0, abs(threshold))
+
+
+# Exponent of the largest finite binary64 float (2 ** 1023).  Rescaled group
+# totals are kept a safety margin below it: cross-cohort sums used only for
+# the item-ordering heuristic can then combine a realistic number of cohorts
+# without overflowing.
+_MAX_EXPONENT = 1023
+_SCALING_SAFETY_MARGIN = 32
+
+
+def _group_scaling_exponent(max_weight, min_positive, n_positive):
+    """Pick a power-of-two unit change ``2**k`` for one weight group.
+
+    The weights of a single cohort (or of the whole batch in weight-only
+    mode) are rescaled by a common power of two.  Multiplying a binary
+    floating-point number by a power of two only moves the exponent, so the
+    rescaling is exact whenever the result stays inside the floating-point
+    range, and every weighted ratio is unchanged because the numerator and
+    denominator of a support are multiplied by the same factor.
+
+    Two bounds must hold simultaneously:
+
+    * the *largest* accumulated counter stays finite: a sum of
+      ``n_positive`` weights, ``n_positive * max_weight * 2**k``, must not
+      exceed ``2**1023`` (half of the finite range);
+    * the *smallest positive* weight stays strictly positive:
+      ``min_positive * 2**k`` must not leave the representable range at the
+      subnormal end (``2**-1074``).
+
+    ``frexp(x) = (m, e)`` with ``0.5 <= m < 1`` gives ``x = m * 2**e``, so
+    the exponent of ``x`` is ``e - 1``.  No rescaling is applied when plain
+    weights already satisfy both bounds, keeping ordinary inputs on their
+    original code path; otherwise the largest exponent that still prevents
+    the overflow is chosen, which keeps rescaled counters as large (and
+    supports as precise) as possible.
+    """
+    # Lower bound: frexp(min_positive) = (m, e) with 0.5 <= m < 1 means the
+    # value's binary exponent is e - 1.  Require e - 1 + k >= -1074 so the
+    # smallest weight never leaves the (subnormal) representable range.
+    _, min_exp = math.frexp(min_positive)
+    exponent_min = -1073 - min_exp
+
+    # Upper bound: use frexp's exponent additivity instead of forming
+    # n_positive * max_weight (which may already overflow to inf).  The
+    # binary exponent of a product is (e_max - 1) + floor(log2(n)); require
+    # it plus k to stay below the finite limit minus the safety margin, so
+    # later cross-cohort ordering sums stay finite as well.  ``max_weight``
+    # is the largest *positive* weight even when the group also has zero rows.
+    _, max_exp = math.frexp(max_weight)
+    exponent_max = (
+        _MAX_EXPONENT
+        - _SCALING_SAFETY_MARGIN
+        - (max_exp - 1)
+        - int(math.log2(n_positive))
+    )
+    if exponent_max < exponent_min:
+        raise ValueError(
+            "The weights span a range too wide for floating-point "
+            "arithmetic: no common power-of-two unit keeps the largest sums "
+            "finite while keeping the smallest positive weight (%r) "
+            "non-zero." % min_positive
+        )
+    if exponent_max >= 0:
+        # Ordinary case: raw weights already fit, leave them untouched.
+        return 0
+    return exponent_max
+
+
+def rescale_weights(weights, cohort_codes=None, n_cohorts=None):
+    """Rescale weights group-wise by exact power-of-two unit changes.
+
+    Returns ``(scaled_weights, exponents, scaled_totals)``.  With cohort
+    codes, ``exponents`` and ``scaled_totals`` are per-cohort arrays; without
+    them a single integer exponent and one total describe the whole batch.
+    Every positive input weight stays positive after rescaling and every
+    zero stays zero, so the positions of zero and positive evidence do not
+    change and all weighted ratios (selected itemsets, supports, rules) are
+    identical.  Groups whose weights already fit are returned unchanged
+    (exponent zero), so ordinary inputs pay nothing beyond the bounds check.
+    """
+    weights = np.asarray(weights, dtype=float)
+    if cohort_codes is None:
+        positive = weights > 0.0
+        n_positive = int(np.count_nonzero(positive))
+        if n_positive == 0:
+            # An empty batch (or an all-zero one) has nothing to rescale;
+            # callers validate positivity separately for non-empty inputs.
+            return weights.copy(), 0, 0.0
+        exponent = _group_scaling_exponent(
+            float(weights[positive].max()),
+            float(weights[positive].min()),
+            n_positive,
+        )
+        scaled = weights if exponent == 0 else weights * (2.0 ** exponent)
+        return scaled, exponent, float(scaled.sum())
+
+    exponents = np.zeros(n_cohorts, dtype=np.int64)
+    scaled = np.empty_like(weights)
+    codes = np.asarray(cohort_codes)
+    for code in range(n_cohorts):
+        group = weights[codes == code]
+        positive = group > 0.0
+        n_positive = int(np.count_nonzero(positive))
+        if n_positive == 0:
+            raise ValueError(
+                "Cohort code %d has no positive weight; every cohort must "
+                "have a positive total weight." % code
+            )
+        exponent = _group_scaling_exponent(
+            float(group[positive].max()),
+            float(group[positive].min()),
+            n_positive,
+        )
+        exponents[code] = exponent
+        scaled[codes == code] = (
+            group if exponent == 0 else group * (2.0 ** exponent)
+        )
+
+    totals = np.zeros(n_cohorts, dtype=float)
+    with np.errstate(over="ignore"):
+        np.add.at(totals, codes, scaled)
+    return scaled, exponents, totals
 
 
 def _add_count(current, increment):
@@ -74,14 +314,28 @@ def _has_support(count, minsup):
         # threshold; this happens only for legacy scalar trees.
         return _ge_threshold(count, max(minsup.values()))
     if isinstance(count, dict):
-        return _ge_threshold(sum(count.values()), minsup)
+        return _ge_threshold(_rank_key(count), minsup)
     return _ge_threshold(count, minsup)
 
 
 def _rank_key(count):
-    """Ordering key for an item counter (most frequent last)."""
+    """Ordering key for an item counter (most frequent last).
+
+    Cohort counters may each hold a rescaled weight close to the finite
+    float limit, so adding them across cohorts can overflow even though the
+    ordering only needs their combined *magnitude*.  When a plain sum is not
+    finite, fall back to a magnitude comparison built from the largest
+    summand and the number of contributors, which stays finite and preserves
+    the ranking.
+    """
     if isinstance(count, dict):
-        return sum(count.values())
+        if not count:
+            return 0.0
+        total = sum(count.values())
+        if math.isfinite(total):
+            return total
+        largest = max(count.values())
+        return largest * (1.0 + math.log1p(len(count)))
     return count
 
 
@@ -190,7 +444,25 @@ def _item_counts(
                 keys, weights=block_weights, minlength=n_cohorts * n_items
             )
             counts += block.reshape(n_cohorts, n_items)
-        return counts, counts.sum(axis=0)
+        # The cross-cohort sum only drives the item ordering heuristic.  A
+        # group-wise rescale can put each cohort counter close to the float
+        # limit, so the sum may overflow; rank the affected ties by the
+        # largest finite summand instead of an +inf value.  Columns without
+        # any positive counter simply get order weight zero.
+        finite_sum = counts.sum(axis=0)
+        # Columns with no positive counter make the nanmax input all-NaN;
+        # that is an expected "order weight zero" case, not an error.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            safe_max = np.nanmax(
+                np.where(counts > 0.0, counts, np.nan), axis=0
+            )
+        order_weights = np.where(
+            np.isfinite(finite_sum),
+            finite_sum,
+            np.nan_to_num(safe_max, nan=0.0),
+        )
+        return counts, order_weights
 
     counts = np.zeros(n_items, dtype=float)
     for rows, cols in _iter_row_items(matrix, is_sparse):
@@ -349,6 +621,7 @@ def generate_itemsets(
     cohort_codes=None,
     cohort_labels=None,
     cohort_totals=None,
+    weighted_total=None,
 ):
     if disabled is None and cohort_codes is not None:
         return _generate_cohort_itemsets(
@@ -362,28 +635,48 @@ def generate_itemsets(
     if disabled is None:
         # Weighted single-cohort mining: support is weighted count over the
         # total row weight, and zero-weight rows were never inserted.
-        total_weight = (
-            float(len(df.index))
-            if sample_weight is None
-            else float(sample_weight.sum())
-        )
+        # ``weighted_total`` is the (possibly rescaled) total the tree was
+        # built with; rescaling multiplies every count and the total by the
+        # same power of two, so the displayed support is unchanged.
+        if weighted_total is not None:
+            total_weight = float(weighted_total)
+        else:
+            total_weight = (
+                float(len(df.index))
+                if sample_weight is None
+                else float(sample_weight.sum())
+            )
         itemsets = []
         supports = []
-        for sup, iset in generator:
-            support = sup / total_weight if total_weight else 0.0
-            slack = _SUPPORT_EPS * max(1.0, abs(min_support))
-            if support >= min_support - slack:
-                itemsets.append(frozenset(iset))
-                supports.append(support)
+        tiny_counts = {}
+        threshold_count = min_support * total_weight
+        for count, iset in generator:
+            itemset = frozenset(iset)
+            # Selection runs on the actual (rescaled) counts.  This is what
+            # keeps a positive count whose support displays as zero from
+            # being confused with a true zero.
+            if not _ge_threshold(float(count), threshold_count):
+                continue
+            support = count / total_weight if total_weight else 0.0
+            translated = (
+                frozenset(colname_map[i] for i in itemset)
+                if colname_map is not None
+                else itemset
+            )
+            itemsets.append(translated)
+            supports.append(support)
+            if support <= 0.0 and count > 0.0:
+                # Genuine positive evidence that the float support column
+                # cannot show: hand it to the rule stage through the sidecar.
+                tiny_counts[(translated, None)] = float(count)
         res_df = pd.DataFrame({"support": supports, "itemsets": itemsets})
         if len(res_df.index) == 0:
             res_df = pd.DataFrame(
                 {"support": pd.Series(dtype=float), "itemsets": pd.Series(dtype=object)}
             )
-        if colname_map is not None:
-            res_df["itemsets"] = res_df["itemsets"].apply(
-                lambda x: frozenset([colname_map[i] for i in x])
-            )
+        res_df.attrs[EVIDENCE_ATTR] = build_weighted_evidence(
+            tiny_counts, {None: total_weight}
+        )
         return res_df
 
     itemsets = []
@@ -445,12 +738,21 @@ def _generate_cohort_itemsets(
     itemset within a cohort is its weighted count in that cohort divided by
     the cohort's total row weight (empty baskets included in the
     denominator).
+
+    Selection uses the raw weighted counts against each cohort's absolute
+    count threshold rather than the computed support, so a positive count
+    whose support underflows to zero is never mistaken for a true zero.
+    Positively supported itemsets whose displayed support is zero are
+    recorded in the evidence sidecar for the rule stage.
     """
     hits = []
     counters_by_itemset = []
+    translated_itemsets = []
+    tiny_counts = {}
     seen = set()
-    slack = _SUPPORT_EPS * max(1.0, abs(min_support))
     n_cohorts = len(cohort_labels)
+    thresholds = np.asarray(cohort_totals, dtype=float) * min_support
+
     for count, iset in generator:
         itemset = frozenset(iset)
         if itemset in seen:
@@ -461,28 +763,68 @@ def _generate_cohort_itemsets(
             # Defensive: a scalar counter means total weight with no cohort
             # breakdown, which cannot be attributed to individual cohorts.
             counters = [float(count)] + [0.0] * (n_cohorts - 1)
-        supports = [
-            counters[code] / cohort_totals[code] if cohort_totals[code] else 0.0
+        if not any(
+            _ge_threshold(counters[code], thresholds[code])
             for code in range(n_cohorts)
-        ]
-        if not any(support >= min_support - slack for support in supports):
+        ):
             continue
         seen.add(itemset)
+        translated = (
+            frozenset(colname_map[i] for i in itemset)
+            if colname_map is not None
+            else itemset
+        )
         hits.append(itemset)
-        counters_by_itemset.append(supports)
+        translated_itemsets.append(translated)
+        counters_by_itemset.append(counters)
+
+        for code in range(n_cohorts):
+            positive_count = counters[code]
+            if positive_count > 0.0:
+                support = (
+                    positive_count / cohort_totals[code]
+                    if cohort_totals[code]
+                    else 0.0
+                )
+                if support <= 0.0:
+                    # Positive evidence hidden by float underflow; remember
+                    # the count keyed by the stable cohort *label* (not its
+                    # first-appearance position, which changes when rows are
+                    # permuted) so association_rules can tell it apart from a
+                    # genuinely absent itemset.
+                    tiny_counts[(translated, cohort_labels[code])] = positive_count
 
     if not hits:
-        return pd.DataFrame(columns=["cohort", "support", "itemsets"])
+        empty_df = pd.DataFrame(columns=["cohort", "support", "itemsets"])
+        empty_df.attrs[EVIDENCE_ATTR] = build_weighted_evidence(
+            {},
+            {
+                cohort_labels[code]: float(total)
+                for code, total in enumerate(cohort_totals)
+            },
+        )
+        return empty_df
 
     # Expand itemset-major: each retained itemset gets one row per cohort.
     # Building the flattened columns directly (rather than one Python tuple
     # per output row) keeps the transient cost close to the final frame even
     # when the output has millions of rows.
-    supports_matrix = np.asarray(counters_by_itemset, dtype=float)
+    counters_matrix = np.asarray(counters_by_itemset, dtype=float)
+    totals = np.asarray(cohort_totals, dtype=float)
+    # Every validated cohort has a positive total, but guard the division
+    # anyway: explicit underflow zeros are fine because their positive counts
+    # survive in the sidecar, and true zeros stay exactly zero.
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        supports_matrix = counters_matrix / totals[np.newaxis, :]
+    supports_matrix = np.nan_to_num(
+        supports_matrix, nan=0.0, posinf=0.0, neginf=0.0
+    )
     flat_supports = supports_matrix.reshape(-1)
     cohort_indices = np.tile(np.arange(n_cohorts), len(hits))
     cohort_column = np.asarray(cohort_labels, dtype=object)[cohort_indices]
-    itemset_column = [itemset for itemset in hits for _ in range(n_cohorts)]
+    itemset_column = [
+        itemset for itemset in translated_itemsets for _ in range(n_cohorts)
+    ]
 
     res_df = pd.DataFrame(
         {
@@ -491,16 +833,13 @@ def _generate_cohort_itemsets(
             "itemsets": itemset_column,
         }
     )
-    if colname_map is not None:
-        # Translate each distinct itemset once and reuse the object for all
-        # of its cohort rows; a per-row ``apply`` would allocate one frozen
-        # set per output row and double the transient footprint.
-        translated = {
-            itemset: frozenset([colname_map[i] for i in itemset]) for itemset in hits
-        }
-        res_df["itemsets"] = [
-            translated[itemset] for itemset in hits for _ in range(n_cohorts)
-        ]
+    res_df.attrs[EVIDENCE_ATTR] = build_weighted_evidence(
+        tiny_counts,
+        {
+            cohort_labels[code]: float(total)
+            for code, total in enumerate(cohort_totals)
+        },
+    )
     return res_df
 
 
@@ -587,14 +926,26 @@ def prepare_cohorts(df, cohorts, sample_weight):
         if np.any(weights < 0):
             raise ValueError("`sample_weight` must be non-negative.")
 
-    totals = np.zeros(len(labels), dtype=float)
-    np.add.at(totals, codes, weights)
-    if len(labels) and np.any(totals <= 0):
-        empty = [labels[i] for i in np.nonzero(totals <= 0)[0]]
+    # Positivity is established from the individual weights instead of the
+    # summed totals: a legitimate cohort total may overflow to +inf when the
+    # weights are huge, but it is still a positive total.  The raw totals are
+    # kept for callers on ordinary-scale inputs; weighted mining rescales
+    # them before any absolute threshold is derived.
+    positive_rows = np.bincount(
+        codes, weights=(weights > 0.0).astype(np.int64), minlength=len(labels)
+    )
+    if len(labels) and np.any(positive_rows == 0):
+        empty = [labels[i] for i in np.nonzero(positive_rows == 0)[0]]
         raise ValueError(
             "Every cohort must have a positive total weight; "
             "cohort(s) %s have total weight <= 0." % ", ".join(map(repr, empty))
         )
+    totals = np.zeros(len(labels), dtype=float)
+    # The raw totals may legitimately overflow for huge weights; weighted
+    # mining rescales such groups before using them.  The overflow is not an
+    # error here, only a signal that the absolute-total path is unusable.
+    with np.errstate(over="ignore"):
+        np.add.at(totals, codes, weights)
     return codes, labels, totals, weights
 
 
@@ -610,7 +961,9 @@ def prepare_sample_weight(df, sample_weight):
         raise ValueError("`sample_weight` must contain only finite values.")
     if np.any(weights < 0):
         raise ValueError("`sample_weight` must be non-negative.")
-    if n_rows and float(weights.sum()) <= 0:
+    # Check positivity directly: the summed total may legitimately overflow
+    # for huge weights and is rescaled later.
+    if n_rows and not np.any(weights > 0.0):
         raise ValueError("`sample_weight` must have a positive total weight.")
     return weights
 

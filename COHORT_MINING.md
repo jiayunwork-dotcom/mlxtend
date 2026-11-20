@@ -102,6 +102,69 @@ association_rules(df, num_itemsets=1, df_orig=None, null_values=False,
    and raises instead of zero-filling. This is what keeps a below-mining-
    threshold cohort from being mistaken for zero evidence.
 
+## Wide weight ranges: scaling and retained evidence
+
+Weighted mining must keep three situations apart at every stage (FP-tree
+counts and conditional projections, `fpgrowth` pruning and the result table,
+rule evidence lookup and filtering):
+
+* **no positive weight** for an itemset in a cohort (a genuine zero);
+* **positive support so small that the float `support` column displays it as
+  zero** (underflow, but real evidence);
+* **an itemset missing from the result table altogether** (incomplete input,
+  which must raise rather than be treated as zero).
+
+### Exact per-group power-of-two rescaling
+
+A batch whose individual weights are finite can still have totals outside
+the float range (e.g. `3 * 2**1023` overflows). Before the tree is built,
+each cohort's weights (or the whole batch in weight-only mode) are multiplied
+by one common power of two, `2**k`. Multiplying a binary float by a power of
+two only changes its exponent, so the operation is exact while the result
+stays in range, and every support ratio is unchanged because the numerator
+and denominator of a cohort use the same factor. The exponent is chosen from
+the frexp exponents of the group's smallest positive weight and its largest
+possible accumulated count, without ever forming an overflowing product.
+Groups that already fit keep exponent zero, so ordinary inputs follow their
+original arithmetic and pay only an O(rows) bounds scan. When no power of
+two can keep the largest sum finite and the smallest weight positive, the
+caller gets a clear `ValueError` instead of silently corrupted counts.
+
+Cost: one extra pass over the weight array per group and one rescaled copy
+of it (O(rows) memory, the same order as the existing weight vector). Tree
+counters, thresholds and pruning are otherwise untouched.
+
+### What mining keeps, and what is deferred to the rules stage
+
+The result table keeps its existing float `support` column and display
+precision, and an empty basket still counts in the cohort denominator. A
+positive count whose support underflows to zero cannot be reconstructed from
+that column, so the miner additionally attaches a small **evidence sidecar**
+to the result frame's `attrs`:
+
+* `tiny_counts`: only the `(itemset, cohort label) -> positive scaled count`
+  entries whose displayed support is zero — typically a handful, never the
+  whole result;
+* `cohort_totals`: the scaled total weight per cohort (one float each).
+
+Everything else is deferred to rule time: ordinary positive supports are
+turned back into counts as `support * cohort_total` on demand, and rule
+metrics are computed from those counts. Ratios such as confidence and lift
+go through a safe fraction helper that uses ordinary division when it is
+finite and exact, and only falls back to log-space accumulation when a
+product would overflow or underflow; `inf`/`0.0`/`NaN` appear only when the
+true metric crosses those bounds. The sidecar is keyed by stable cohort
+labels (not first-appearance positions) and rides on `DataFrame.attrs`, so
+copying the whole result or permuting its rows keeps the evidence attached
+and the rule output independent of row order. A hand-built support table
+without the sidecar keeps the legacy behaviour: an explicit zero is a real
+zero and yields the historical NaN confidence.
+
+Resident overhead is therefore proportional to the actual underflowing
+prefix/candidate/result entries plus one float per cohort, not to the number
+of rows or items; sparse inputs still share the single mined tree, and the
+rule entry point needs nothing beyond the result table.
+
 ## Reproducible verification
 
 Create an isolated environment (the repository pins are older; the checks
@@ -117,6 +180,7 @@ Run the focused suite:
 
 ```bash
 python -m pytest mlxtend/frequent_patterns/tests/test_cohorts.py -q
+python -m pytest mlxtend/frequent_patterns/tests/test_weighted_scaling.py -q
 python -m pytest mlxtend/frequent_patterns/tests -q
 ```
 
@@ -126,6 +190,15 @@ zero reference support, empty baskets, fractional/zero weights, duplicate
 index, row/column/cohort reordering, sparse input, `max_len`, invalid inputs,
 the legacy `fpgrowth`/`fpmax`/`association_rules` behaviour, shared-tree
 memory versus independent trees, and insertion work being linear in rows.
+
+`test_weighted_scaling.py` pins the two wide-range failures with small
+baskets: overflowing total weights (`2**1023`) in both entry points, tiny
+positive reference evidence (`2**-600` / `2**600`) that displays as zero but
+keeps a finite 0.5 reference confidence, genuinely zero reference weights
+that keep that confidence undefined (NaN and filtered by a delta bound),
+true-zero versus displayed-zero handling, a copied and row-permuted mining
+result, and the weight-only call. It also property-checks the rescaling
+exponent bounds and the impossible-span error.
 
 Scale check (64 cohorts, 100k baskets, 500 items, <= 12 items per basket,
 sparse DataFrame), one implementation-specific run:
